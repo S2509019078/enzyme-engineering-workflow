@@ -3,11 +3,13 @@ from __future__ import annotations
 from dataclasses import asdict
 from pathlib import Path
 import csv
+import json
 import shutil
 import yaml
 
 import pandas as pd
 
+from .cache import build_payload, manifest_valid, write_manifest
 from .foldx import FoldXRunner
 from .mapping import build_mapping, read_fasta
 from .models import Candidate, ResidueMapping
@@ -70,6 +72,9 @@ class EnzymeWorkflow:
         value = str(row.get(key, "")).strip()
         return value if value else self.config.settings.get(key, default)
 
+    def _manifest(self, stage: str, name: str) -> Path:
+        return self.config.work_dir / "manifests" / stage / f"{name}.json"
+
     def selected(self, name=None):
         if not self.enzymes:
             raise ValueError(f"no enzyme definitions loaded from {self.config.enzymes_table}")
@@ -100,27 +105,35 @@ class EnzymeWorkflow:
             direction = self._setting(row, "score_direction", "higher_is_better")
             source = self._setting(row, "online_source", "mutation_effect")
             mode = self._setting(row, "online_mode", "mutation_effect")
+            source_path = self.config.resolve(row["online_result"])
             out = self.config.work_dir / "normalized" / f"{row['name']}.csv"
-            if out.exists() and not force:
+            payload = build_payload({"online_result": source_path}, {"threshold": threshold, "direction": direction, "source": source, "mode": mode})
+            manifest = self._manifest("normalize", row["name"])
+            if not force and manifest_valid(manifest, payload, [out]):
                 outputs.append(out)
                 continue
             out.parent.mkdir(parents=True, exist_ok=True)
-            source_path = self.config.resolve(row["online_result"])
             frame = normalize_pairwise_couplings(source_path) if mode == "pairwise_coupling" else normalize_scores(source_path, row["name"], source, direction, threshold)
             frame.to_csv(out, index=False)
+            write_manifest(manifest, payload, [out])
             outputs.append(out)
         return outputs
 
     def map(self, name=None, force=False):
         outputs = []
         for row in self.selected(name):
+            fasta = self.config.resolve(row["fasta"])
+            pdb = self.config.resolve(row["pdb"])
             out = self.config.work_dir / "mapping" / f"{row['name']}.csv"
-            if out.exists() and not force:
+            payload = build_payload({"fasta": fasta, "pdb": pdb}, {"chain": row["chain"]})
+            manifest = self._manifest("mapping", row["name"])
+            if not force and manifest_valid(manifest, payload, [out]):
                 outputs.append(out)
                 continue
-            mappings = build_mapping(self.config.resolve(row["fasta"]), self.config.resolve(row["pdb"]), row["chain"])
+            mappings = build_mapping(fasta, pdb, row["chain"])
             out.parent.mkdir(parents=True, exist_ok=True)
             pd.DataFrame([asdict(item) for item in mappings]).to_csv(out, index=False)
+            write_manifest(manifest, payload, [out])
             outputs.append(out)
         return outputs
 
@@ -132,42 +145,70 @@ class EnzymeWorkflow:
             mode = self._setting(row, "online_mode", "mutation_effect")
             if mode == "pairwise_coupling":
                 raise ValueError("pairwise coupling tables cannot directly generate single-mutant FoldX jobs")
-            normalized = pd.read_csv(self.config.work_dir / "normalized" / f"{row['name']}.csv")
+            normalized_path = self.config.work_dir / "normalized" / f"{row['name']}.csv"
+            mapping_path = self.config.work_dir / "mapping" / f"{row['name']}.csv"
+            normalized = pd.read_csv(normalized_path)
             selected = normalized[normalized["selected"].astype(str).str.lower().isin({"true", "1"})]
             if selected.empty:
                 raise ValueError(f"no candidates passed the selection threshold for {row['name']}")
             sequence = read_fasta(self.config.resolve(row["fasta"]))
             saturation = str(self._setting(row, "saturation_scan", True)).lower() in {"true", "1", "yes"}
-            if saturation:
-                candidates = expand_saturation(sorted(set(int(value) for value in selected["sequence_position"])), sequence)
-            else:
-                candidates = [Candidate(int(item.sequence_position), str(item.wild_type).upper(), str(item.mutant).upper()) for item in selected.itertuples()]
-            mapping_frame = pd.read_csv(self.config.work_dir / "mapping" / f"{row['name']}.csv")
+            candidates = expand_saturation(sorted(set(int(value) for value in selected["sequence_position"])), sequence) if saturation else [Candidate(int(item.sequence_position), str(item.wild_type).upper(), str(item.mutant).upper()) for item in selected.itertuples()]
+            mapping_frame = pd.read_csv(mapping_path)
             mapping = {int(item.sequence_position): ResidueMapping(int(item.sequence_position), str(item.sequence_residue), str(item.chain), int(item.structure_position), str(item.structure_residue)) for item in mapping_frame.itertuples()}
             valid, rejected = partition_candidates(candidates, mapping)
             work = self.config.work_dir / "foldx" / row["name"]
             work.mkdir(parents=True, exist_ok=True)
-            pd.DataFrame([{**asdict(candidate), "reason": reason} for candidate, reason in rejected]).to_csv(work / "rejected_candidates.csv", index=False)
+            pd.DataFrame([{**asdict(candidate), "reason": reason} for candidate, reason in rejected], columns=["sequence_position", "wild_type", "mutant", "reason"]).to_csv(work / "rejected_candidates.csv", index=False)
             if not valid:
                 raise ValueError(f"all candidates were rejected after FASTA-PDB validation for {row['name']}")
+            exact_scores = {(int(item.sequence_position), str(item.wild_type).upper(), str(item.mutant).upper()): item for item in selected.itertuples()}
+            metadata = []
+            for candidate in valid:
+                exact = exact_scores.get((candidate.sequence_position, candidate.wild_type, candidate.mutant))
+                record = asdict(candidate)
+                record.update({"source_score": getattr(exact, "source_score", None) if exact else None, "source": getattr(exact, "source", None) if exact else None, "source_direction": getattr(exact, "source_direction", None) if exact else None, "source_selected_exact_mutation": bool(exact)})
+                metadata.append(record)
             batch_size = int(self._setting(row, "batch_size", 200))
             if batch_size < 1:
                 raise ValueError("batch_size must be positive")
-            for old in work.glob("batch_*" ):
-                if force and old.is_dir():
+            expected_batch_names = {f"batch_{index // batch_size + 1:04d}" for index in range(0, len(valid), batch_size)}
+            for old in work.glob("batch_*"):
+                if old.is_dir() and old.name not in expected_batch_names:
                     shutil.rmtree(old)
+            batch_manifest = {"schema_version": 1, "enzyme": row["name"], "batches": []}
             for index in range(0, len(valid), batch_size):
                 batch_candidates = valid[index:index + batch_size]
+                batch_metadata = metadata[index:index + batch_size]
                 batch_dir = work / f"batch_{index // batch_size + 1:04d}"
                 batch_dir.mkdir(parents=True, exist_ok=True)
                 write_individual_list(batch_candidates, mapping, batch_dir / "individual_list.txt")
-                pd.DataFrame([asdict(item) for item in batch_candidates]).to_csv(batch_dir / "candidates.csv", index=False)
+                pd.DataFrame(batch_metadata).to_csv(batch_dir / "candidates.csv", index=False)
+                batch_manifest["batches"].append(batch_dir.name)
                 outputs.append(batch_dir / "individual_list.txt")
+            (work / "batch_manifest.json").write_text(json.dumps(batch_manifest, ensure_ascii=False, indent=2), encoding="utf-8")
             source_pdb = self.config.resolve(row["pdb"])
             pdb_target = work / source_pdb.name
-            if force or not pdb_target.exists():
+            if force or not pdb_target.exists() or source_pdb.read_bytes() != pdb_target.read_bytes():
                 shutil.copy2(source_pdb, pdb_target)
         return outputs
+
+    def _batch_names(self, work: Path) -> list[str]:
+        manifest = work / "batch_manifest.json"
+        if not manifest.exists():
+            raise FileNotFoundError(f"missing batch manifest: {manifest}")
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+        names = data.get("batches", [])
+        if not names:
+            raise ValueError(f"batch manifest contains no batches: {manifest}")
+        return names
+
+    def _batch_result_valid(self, batch_dir: Path, dif: Path, mutations: list[str]) -> bool:
+        try:
+            frame = parse_dif_fxout(dif, mutations)
+        except Exception:
+            return False
+        return len(frame) == len(mutations)
 
     def run(self, name=None, force=False):
         self.prepare(name=name, force=force)
@@ -180,16 +221,31 @@ class EnzymeWorkflow:
                 raise ValueError("number_of_runs values other than 1 are not yet supported safely")
             root_runner = FoldXRunner(executable, work, number_of_runs=1, out_pdb=False)
             repaired = work / f"{Path(row['pdb']).stem}_Repair.pdb"
-            if force or not repaired.exists():
+            repair_payload = build_payload({"pdb": work / Path(row["pdb"]).name}, {"command": "RepairPDB"}, {"foldx": str(executable)})
+            repair_manifest = self._manifest("repair", row["name"])
+            if force or not manifest_valid(repair_manifest, repair_payload, [repaired]):
                 repaired = root_runner.repair(Path(row["pdb"]).name)
-            for batch_dir in sorted(work.glob("batch_*")):
+                write_manifest(repair_manifest, repair_payload, [repaired])
+            for batch_name in self._batch_names(work):
+                batch_dir = work / batch_name
+                individual = batch_dir / "individual_list.txt"
+                candidates_csv = batch_dir / "candidates.csv"
+                mutations = [line.strip() for line in individual.read_text(encoding="utf-8").splitlines() if line.strip()]
                 expected = batch_dir / f"Dif_{repaired.stem}.fxout"
-                if expected.exists() and expected.stat().st_size > 0 and not force:
+                payload = build_payload({"repaired_pdb": repaired, "individual_list": individual, "candidates": candidates_csv}, {"number_of_runs": 1}, {"foldx": str(executable)})
+                manifest = self._manifest("build", f"{row['name']}__{batch_name}")
+                if not force and manifest_valid(manifest, payload, [expected]) and self._batch_result_valid(batch_dir, expected, mutations):
                     outputs.append(expected)
                     continue
+                for stale in batch_dir.glob("Dif_*.fxout"):
+                    stale.unlink()
                 shutil.copy2(repaired, batch_dir / repaired.name)
                 runner = FoldXRunner(executable, batch_dir, number_of_runs=1, out_pdb=False)
-                outputs.append(runner.build_batch(repaired.name, batch_dir / "individual_list.txt"))
+                dif = runner.build_batch(repaired.name, individual)
+                if not self._batch_result_valid(batch_dir, dif, mutations):
+                    raise ValueError(f"incomplete or mismatched FoldX output in {batch_dir}")
+                write_manifest(manifest, payload, [dif])
+                outputs.append(dif)
         return outputs
 
     def report(self, name=None):
@@ -197,7 +253,8 @@ class EnzymeWorkflow:
         for row in self.selected(name):
             work = self.config.work_dir / "foldx" / row["name"]
             frames = []
-            for batch_dir in sorted(work.glob("batch_*")):
+            for batch_name in self._batch_names(work):
+                batch_dir = work / batch_name
                 dif_files = sorted(batch_dir.glob("Dif_*.fxout"))
                 if len(dif_files) != 1:
                     raise FileNotFoundError(f"expected one Dif_*.fxout in {batch_dir}, found {len(dif_files)}")
@@ -206,14 +263,13 @@ class EnzymeWorkflow:
                 candidates = pd.read_csv(batch_dir / "candidates.csv")
                 if len(frame) != len(candidates):
                     raise ValueError(f"FoldX row count mismatch in {batch_dir}")
-                frame["sequence_position"] = candidates["sequence_position"].values
-                frame["wild_type"] = candidates["wild_type"].values
-                frame["mutant"] = candidates["mutant"].values
+                for column in candidates.columns:
+                    frame[column] = candidates[column].values
                 frame["batch"] = batch_dir.name
                 frames.append(frame)
-            if not frames:
-                raise FileNotFoundError(f"no completed FoldX batches for {row['name']}")
             combined = pd.concat(frames, ignore_index=True)
+            combined["source_rank"] = combined["source_score"].rank(method="min", ascending=False, na_option="bottom") if "source_score" in combined else None
+            combined["candidate_priority"] = combined.apply(lambda item: "model_and_stability" if pd.notna(item.get("source_score")) and item["ddg_kcal_mol"] <= -1.0 else ("stability_only" if item["ddg_kcal_mol"] <= -1.0 else "review"), axis=1)
             result_dir = self.config.results_dir / row["name"]
             result_dir.mkdir(parents=True, exist_ok=True)
             combined.to_csv(result_dir / "foldx_results.csv", index=False)
