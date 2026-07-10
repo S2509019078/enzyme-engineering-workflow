@@ -4,14 +4,20 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "enzymeflow"
-version = "0.1.0"
+version = "1.0.0"
 description = "Reusable enzyme engineering and FoldX workflow"
 requires-python = ">=3.10"
-dependencies = ["pandas>=2.0", "biopython>=1.80", "PyYAML>=6.0", "matplotlib>=3.7", "seaborn>=0.12", "openpyxl>=3.1"]
+dependencies = ["pandas>=2.0", "biopython>=1.80", "PyYAML>=6.0", "matplotlib>=3.7", "openpyxl>=3.1"]
+
+[project.optional-dependencies]
+test = ["pytest>=8.0"]
 
 [project.scripts]
 enzymeflow = "enzymeflow.cli:main"
 
+[tool.setuptools.packages.find]
+where = ["src"]
+
 [tool.pytest.ini_options]
 pythonpath = ["src"]
-
+testpaths = ["tests"]
