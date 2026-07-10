@@ -47,6 +47,17 @@ def copy_input(source: Path, destination: Path) -> Path:
     return destination
 
 
+def resolve_foldx(value: str) -> str:
+    text = value.strip() or "foldx"
+    explicit = Path(text).expanduser()
+    if explicit.is_file():
+        return str(explicit.resolve())
+    found = shutil.which(text)
+    if found:
+        return str(Path(found).resolve())
+    return text
+
+
 def write_project(run_dir: Path, row: dict, foldx_path: str = "foldx") -> Path:
     enzymes_path = run_dir / "config" / "enzymes.tsv"
     columns = ["name", "fasta", "pdb", "chain", "online_result", "online_mode", "online_source", "score_direction", "selection_threshold", "saturation_scan", "batch_size", "number_of_runs", "stable_max_ddg", "neutral_max_ddg"]
@@ -102,7 +113,7 @@ def interactive_wizard(input_fn=input, print_fn=print, base_dir: Path = Path("ru
     threshold_text = input_fn("筛选阈值 [0.0]: ").strip()
     threshold = float(threshold_text) if threshold_text else 0.0
     saturation = input_fn("对入选位点做19种饱和突变？ Y/n [Y]: ").strip().lower() not in {"n", "no", "0"}
-    foldx_path = input_fn("FoldX 可执行文件路径或命令名 [foldx]: ").strip() or "foldx"
+    foldx_path = resolve_foldx(input_fn("FoldX 可执行文件路径或命令名 [foldx]: "))
 
     row = {
         "name": safe_name(project_name),
