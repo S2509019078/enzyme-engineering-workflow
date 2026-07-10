@@ -1,22 +1,51 @@
 import argparse
 from pathlib import Path
 
+from .workflow import EnzymeWorkflow, WorkflowConfig
+
+
 def main(argv=None):
-    ap=argparse.ArgumentParser(prog="enzymeflow", description="可复用酶改造与 FoldX 流程")
-    ap.add_argument("command", choices=["check","normalize","map","prepare","run","report","status","all"])
-    ap.add_argument("--config", type=Path, default=Path("config/config.yaml"))
-    ap.add_argument("--enzyme")
-    ap.add_argument("--force", action="store_true")
-    args=ap.parse_args(argv)
+    parser = argparse.ArgumentParser(prog="enzymeflow", description="可复用酶改造与 FoldX 工作流")
+    parser.add_argument("command", choices=["check", "normalize", "map", "prepare", "run", "report", "status", "all"])
+    parser.add_argument("--config", type=Path, default=Path("config/config.yaml"))
+    parser.add_argument("--enzyme")
+    parser.add_argument("--force", action="store_true")
+    args = parser.parse_args(argv)
+
+    config = WorkflowConfig(args.config)
+    workflow = EnzymeWorkflow(config)
+
     if args.command == "check":
-        print(f"config: {args.config} {'OK' if args.config.exists() else 'MISSING'}")
-        print("FoldX is supplied by the user and is never bundled.")
-        return 0 if args.config.exists() else 2
-    if args.command == "status":
-        p=Path("work/status.csv"); print(p.read_text(encoding="utf-8") if p.exists() else "no tasks")
+        problems = workflow.check()
+        if problems:
+            for problem in problems:
+                print(problem)
+            return 2
+        print("environment OK")
         return 0
-    print(f"stage={args.command} enzyme={args.enzyme or 'all'} force={args.force}")
+    if args.command == "status":
+        status_files = sorted(config.work_dir.glob("foldx/*/status.jsonl"))
+        if not status_files:
+            print("no tasks")
+            return 0
+        for path in status_files:
+            print(f"[{path.parent.name}]")
+            print(path.read_text(encoding="utf-8"))
+        return 0
+    if args.command == "normalize":
+        workflow.normalize(name=args.enzyme, force=args.force)
+    elif args.command == "map":
+        workflow.map(name=args.enzyme, force=args.force)
+    elif args.command == "prepare":
+        workflow.prepare(name=args.enzyme, force=args.force)
+    elif args.command == "run":
+        workflow.run(name=args.enzyme, force=args.force)
+    elif args.command == "report":
+        workflow.report(name=args.enzyme)
+    elif args.command == "all":
+        workflow.all(name=args.enzyme, force=args.force)
     return 0
 
-if __name__ == "__main__": raise SystemExit(main())
 
+if __name__ == "__main__":
+    raise SystemExit(main())
