@@ -1,8 +1,19 @@
 tools:
   foldx: C:/path/to/FoldX.exe
+
+paths:
+  enzymes: config/enzymes.tsv
+  work: work
+  results: results
+
 settings:
+  online_mode: mutation_effect
+  online_source: EVmutation
+  score_direction: higher_is_better
+  selection_threshold: 0.0
+  saturation_scan: true
   number_of_runs: 1
+  out_pdb: false
   stable_max_ddg: -1.0
   neutral_max_ddg: 1.0
   batch_size: 200
-
