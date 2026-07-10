@@ -1,16 +1,22 @@
 import argparse
 from pathlib import Path
 
+from .wizard import interactive_wizard
 from .workflow import EnzymeWorkflow, WorkflowConfig
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="enzymeflow", description="可复用酶改造与 FoldX 工作流")
-    parser.add_argument("command", choices=["check", "normalize", "map", "prepare", "run", "report", "status", "all"])
+    parser.add_argument("command", choices=["wizard", "check", "normalize", "map", "prepare", "run", "report", "status", "all"])
     parser.add_argument("--config", type=Path, default=Path("config/config.yaml"))
+    parser.add_argument("--runs-dir", type=Path, default=Path("runs"), help="wizard 创建独立运行目录的位置")
     parser.add_argument("--enzyme")
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args(argv)
+
+    if args.command == "wizard":
+        interactive_wizard(base_dir=args.runs_dir)
+        return 0
 
     config = WorkflowConfig(args.config)
     workflow = EnzymeWorkflow(config)
