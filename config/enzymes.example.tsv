@@ -1,0 +1,3 @@
+name	fasta	pdb	chain	online_result
+example	inputs/example.fasta	inputs/example.pdb	A	inputs/ev_scores.csv
+
